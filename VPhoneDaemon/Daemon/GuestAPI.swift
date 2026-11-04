@@ -319,6 +319,27 @@ enum GuestAPI {
             guard let phase = (params["phase"] as? String).flatMap(TouchPhase.init(rawValue:)) else {
                 throw GuestAPIError.invalidRequest("phase must be down, move or up")
             }
+            if vp_research_touch_mode() {
+                guard params["normalized"] as? Bool ?? true else {
+                    throw GuestAPIError.invalidRequest("Research Guest touch coordinates are normalized 0..1 only")
+                }
+                let edge = params["edge"] as? Int ?? 0
+                guard (0 ... 15).contains(edge) else {
+                    throw GuestAPIError.invalidRequest("Research Guest touch edge must be a screen-edge bitmask from 0 to 15")
+                }
+                let phaseCode = touchPhaseCode(phase)
+                let x = number(params, "x")
+                let y = number(params, "y")
+                let status = edge == 0
+                    ? vp_research_touch_report(phaseCode, x, y)
+                    : vp_research_touch_edge(phaseCode, x, y, Int32(edge))
+                guard status == 0 else {
+                    throw GuestAPIError.operationFailed(
+                        "Research Guest touch dispatch failed (IOReturn \(status)); check device.input_devices for touchscreen registration and sender",
+                    )
+                }
+                return ["phase": phase.rawValue, "transport": edge == 0 ? "research_hid" : "research_edge", "edge": edge]
+            }
             // A touch that starts at a screen edge needs the digitizer edge
             // flags, which icli does not set; vphoned injects those itself.
             if let edge = params["edge"] as? Int, edge != 0 {

@@ -547,6 +547,9 @@ struct IM4PPayloadParityTests {
 
         try IM4PHandler.save(patchedData: payload, originalIM4P: im4p, to: tempURL)
 
+        // Unchanged iBSS must reproduce Apple's container byte for byte. A
+        // macOS Compression stream round-trips but AVPBooter rejects it.
+        #expect(try Data(contentsOf: tempURL) == originalFile)
         let (roundTripPayload, _) = try IM4PHandler.load(contentsOf: tempURL)
         #expect(roundTripPayload == payload)
         // Written back LZFSE-compressed, as Apple ships it: OpenAVB decodes

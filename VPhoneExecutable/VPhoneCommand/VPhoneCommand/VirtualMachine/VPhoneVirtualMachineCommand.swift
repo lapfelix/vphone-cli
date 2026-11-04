@@ -23,6 +23,8 @@ struct VPhoneVirtualMachineCommand: ParsableCommand {
             VPhoneVirtualMachineExportCommand.self,
             VPhoneVirtualMachineImportCommand.self,
             VPhoneVirtualMachineLaunchCommand.self,
+            VPhoneVirtualMachineResearchUploadCommand.self,
+            VPhoneVirtualMachineResearchViewCommand.self,
             VPhoneVirtualMachineStopCommand.self,
             VPhoneVirtualMachineCreateCommand.self,
             VPhoneVirtualMachineCreateBulkCommand.self,

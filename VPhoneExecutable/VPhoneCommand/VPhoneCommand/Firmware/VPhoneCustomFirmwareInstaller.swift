@@ -1,7 +1,9 @@
 import ArgumentParser
+import CryptoKit
 import Darwin
 import FirmwarePatcher
 import Foundation
+import Security
 import VPhoneArchiveKit
 import VPhoneCoreKit
 import VPhonePatchKit
@@ -83,6 +85,17 @@ struct VPhoneCustomFirmwareInstaller {
     /// plain single-link file, and `enumerateChunks` never mistakes a dotfile
     /// for a `dyld_shared_cache_arm64e*` chunk.
     private static let dscUndoLogLeaf = ".vphone-dsc-undo.json"
+
+    /// The ticket in the installed Preboot volume, for a Research Guests
+    /// recovery boot. A newly fetched TSS ticket can name a different Preboot
+    /// folder and leave SEP unable to find its installed firmware.
+    static let researchBootTicketFileName = "ResearchBootTicket.der"
+
+    /// Unlike shareable VM artifacts, this is an API credential. Keep the
+    /// host copy readable only by the invoking user.
+    static let researchAPITokenFileName = "ResearchAPIToken"
+    private static let researchAPITokenStageName = "research-api-token"
+    private static let researchAPITokenGuestPath = "usr/lib/vphone/research-api-token"
 
     /// Root-owned and sticky, outside every user's tree. The work folder is
     /// made here with `mkdtemp`, so its name cannot be predicted or claimed.
@@ -569,6 +582,7 @@ struct VPhoneCustomFirmwareInstaller {
         let buildVersion = plan?.parameters[FirmwareGuestSystemPatchSet.buildVersionParameter] ?? spoofBuild
         // An environment update has no restore tree to read the device from;
         // the VM's configuration says which board repair its tree takes.
+        var installedResearchBootTicket: Data?
         try liveGuest.formUnion(patchPreboot(
             volumes: volumes,
             work: work,
@@ -580,6 +594,8 @@ struct VPhoneCustomFirmwareInstaller {
             buildVersion: buildVersion,
             boardDeviceTree: boardDeviceTree,
             otaRestore: isOTAUpdate ? restore : nil,
+            captureInstalledTicket: mode == .full,
+            installedTicket: &installedResearchBootTicket,
         ))
         // Selected patches this guest has nothing for, so the receipt does not
         // report them as missing forever: the board audio repair on an
@@ -634,6 +650,26 @@ struct VPhoneCustomFirmwareInstaller {
             try work.directory.setMode("Disk.img", disk.mode & 0o777)
             try work.directory.rename("Disk.img", to: "Disk.img", in: bundleDirectory)
         }
+        if mode == .full {
+            if let installedResearchBootTicket {
+                do {
+                    try bundleDirectory.writeFile(
+                        Self.researchBootTicketFileName,
+                        contents: installedResearchBootTicket,
+                        mode: 0o777,
+                        owner: invokingUser.map { ($0.uid, $0.gid) },
+                    )
+                    print("  [+] Installed Preboot ticket cached for Research Guests boot")
+                } catch {
+                    fputs("warning: could not cache installed Preboot ticket: \(error)\n", stderr)
+                    try? bundleDirectory.removeItem(Self.researchBootTicketFileName)
+                }
+            } else {
+                // A prior install's ticket must not be mistaken for the newly
+                // installed disk's ticket after an OTA or erase restore.
+                try? bundleDirectory.removeItem(Self.researchBootTicketFileName)
+            }
+        }
         if isOTAUpdate {
             recordKernelcacheReceipt(enabled: effectiveEnabled, in: bundleDirectory,
                                      owner: invokingUser.map { ($0.uid, $0.gid) })
@@ -648,6 +684,22 @@ struct VPhoneCustomFirmwareInstaller {
                 work: work,
                 owner: invokingUser.map { ($0.uid, $0.gid) },
             )
+        }
+        if liveGuest.contains("system-vphoned-boot-install"),
+           try work.directory.isRegularFile(Self.researchAPITokenStageName) {
+            // This token authenticates the optional TCP fallback in a Research
+            // Guest. It is deliberately mode 0600, unlike the 0777 host VM
+            // artifacts meant to be shared across workstation accounts.
+            try bundleDirectory.replaceFile(
+                Self.researchAPITokenFileName,
+                fromFileAt: work.file(Self.researchAPITokenStageName),
+                mode: 0o600,
+                owner: invokingUser.map { ($0.uid, $0.gid) },
+            )
+        } else {
+            // A deselected or failed vphoned install must not leave a host
+            // credential that looks usable for the current disk.
+            try bundleDirectory.removeItem(Self.researchAPITokenFileName)
         }
         // Record what is live in the guest now. Written through the pinned
         // bundle descriptor as the caller, 0777 like every other host VM
@@ -1529,6 +1581,8 @@ struct VPhoneCustomFirmwareInstaller {
             if on("system-vphoned-boot-install") {
                 try installVphoned(guestDevice: guestDevice, system: system, work: work)
                 live.insert("system-vphoned-boot-install")
+            } else {
+                try system.removeItem(Self.researchAPITokenGuestPath)
             }
         }
         isolate(["system-launchdaemons-boot-environment"]) {
@@ -3105,6 +3159,23 @@ struct VPhoneCustomFirmwareInstaller {
         try system.copyFile(from: backup, to: "launchd.plist", in: work.directory)
         try CustomFirmwareDaemons.injectDaemon(into: temp, name: "vphoned", from: daemon)
         try system.replaceFile(launchd, fromFileAt: temp, mode: 0o644, owner: Self.guestOwner)
+
+        if guestDevice.family == .iPhone || guestDevice.family == .iPad {
+            var random = [UInt8](repeating: 0, count: 32)
+            guard SecRandomCopyBytes(kSecRandomDefault, random.count, &random) == errSecSuccess else {
+                throw ValidationError("Could not generate the Research Guests API credential.")
+            }
+            let token = random.map { String(format: "%02x", Int($0)) }.joined()
+            let data = Data(token.utf8)
+            // The private work directory is root-only. Stage the exact bytes
+            // that will be written to the guest, then publish them to the
+            // invoking user only after the disk swap completes.
+            try work.directory.writeFile(Self.researchAPITokenStageName, contents: data, mode: 0o600)
+            try system.writeFile(Self.researchAPITokenGuestPath, contents: data,
+                                 mode: 0o400, owner: Self.guestOwner)
+        } else {
+            try system.removeItem(Self.researchAPITokenGuestPath)
+        }
     }
 
     /// Keep rollback available even when the owner also deselects vphoned.
@@ -3389,6 +3460,8 @@ struct VPhoneCustomFirmwareInstaller {
         buildVersion: String?,
         boardDeviceTree: URL?,
         otaRestore: VPhoneConfinedDirectory? = nil,
+        captureInstalledTicket: Bool,
+        installedTicket: inout Data?,
     ) throws -> Set<String> {
         var live = Set<String>()
         // Whether a device-tree patch is enabled. A VM with no plan gets every
@@ -3463,12 +3536,13 @@ struct VPhoneCustomFirmwareInstaller {
 
         let buildID = "system-systemversion-cfw-build_version"
 
-        // Mount only when there is device-tree work to do, a repair to revert,
-        // or a build spoof to apply or revert.
+        // Mount for device-tree/build work, or to capture the installed ticket
+        // while a full install has its private disk clone attached.
         let mayRevertRepair = repairGroup.contains { !enabled($0.id) && priorGuest.contains($0.id) }
         let wantsBuild = (buildVersion.map { !$0.isEmpty } ?? false) && enabled(buildID)
         let touchesBuild = wantsBuild || priorGuest.contains(buildID)
-        guard otaRestore != nil || rewriteIdentity || !repairsOn.isEmpty || mayRevertRepair || touchesBuild else { return live }
+        let editsPreboot = otaRestore != nil || rewriteIdentity || !repairsOn.isEmpty || mayRevertRepair || touchesBuild
+        guard editsPreboot || captureInstalledTicket else { return live }
 
         guard
             let preboot = volumes.first(where: { ($0["Roles"] as? [String])?.contains("Preboot") == true }),
@@ -3496,6 +3570,17 @@ struct VPhoneCustomFirmwareInstaller {
             guard candidates.count == 1, let deviceTree = candidates.first else {
                 throw ValidationError("Expected one device tree in the Preboot volume but found \(candidates.count). Restore the VM, then install CFW again.")
             }
+
+            if captureInstalledTicket {
+                do {
+                    installedTicket = try Self.installedPrebootTicket(
+                        in: root, bootFolder: String(deviceTree.prefix { $0 != "/" }),
+                    )
+                } catch {
+                    fputs("warning: installed Preboot ticket unavailable for Research Guests boot: \(error)\n", stderr)
+                }
+            }
+            guard editsPreboot else { return live }
 
             if let otaRestore {
                 /// Swap only the IM4P inside a personalized Preboot IMG4,
@@ -3564,6 +3649,31 @@ struct VPhoneCustomFirmwareInstaller {
         }
 
         return live
+    }
+
+    /// Read only the ticket paired with the unique boot folder selected above.
+    /// Confined reads reject links in every path component, including the leaf.
+    private static func installedPrebootTicket(
+        in root: VPhoneConfinedDirectory, bootFolder: String,
+    ) throws -> Data {
+        let hex = CharacterSet(charactersIn: "0123456789ABCDEFabcdef")
+        guard bootFolder.utf8.count == 96,
+              bootFolder.unicodeScalars.allSatisfy({ hex.contains($0) })
+        else {
+            throw ValidationError("The Preboot boot folder is not a SHA-384 ticket hash.")
+        }
+        let path = "\(bootFolder)/System/Library/Caches/apticket.der"
+        guard let metadata = try root.status(path), metadata.st_mode & S_IFMT == S_IFREG,
+              metadata.st_size > 0, metadata.st_size <= 1 << 20
+        else {
+            throw ValidationError("The installed Preboot ticket is missing or invalid.")
+        }
+        let ticket = try root.readData(path)
+        let digest = SHA384.hash(data: ticket).map { String(format: "%02X", Int($0)) }.joined()
+        guard digest.caseInsensitiveCompare(bootFolder) == .orderedSame else {
+            throw ValidationError("The installed Preboot ticket does not match its boot folder.")
+        }
+        return ticket
     }
 
     /// Build the final device tree in staging and write it only if it differs

@@ -50,27 +50,31 @@ let hub = APIEventHub()
 let eventPublisher = GuestEventPublisher(hub: hub)
 
 do {
-    let server = try ServerBootstrap(group: group)
+    func makeBootstrap(admission: GuestHyperTextHandler.Admission) -> ServerBootstrap {
+        ServerBootstrap(group: group)
         .serverChannelOption(ChannelOptions.backlog, value: 128)
         .childChannelInitializer { channel in
-            let http = GuestHyperTextHandler(hub: hub, fileIO: fileIO)
+            let http = GuestHyperTextHandler(hub: hub, fileIO: fileIO, admission: admission)
             let upgrader = NIOWebSocketServerUpgrader(
                 maxFrameSize: 1 << 20,
                 shouldUpgrade: { channel, request in
                     // Browsers apply no CORS to WebSockets; refuse any handshake
-                    // that carries Origin or a non-loopback Host. The refused
-                    // request then reaches GuestHyperTextHandler, which replies 403.
-                    let allowed = GuestHyperTextHandler.isLocalClient(request.headers) &&
-                        (request.uri == "/v1/events" || GuestPortForwardHandler.port(from: request.uri) != nil ||
+                    // without the transport's own admission rule. The refused
+                    // request then reaches GuestHyperTextHandler for an error.
+                    let path = request.uri.split(separator: "?", maxSplits: 1).first.map(String.init) ?? request.uri
+                    let allowed = GuestHyperTextHandler.admitsWebSocket(request, admission: admission) &&
+                        (path == "/v1/events" || GuestPortForwardHandler.port(from: path) != nil ||
                             GuestShellSessionHandler.request(from: request.uri) != nil)
                     guard allowed else { return channel.eventLoop.makeSucceededFuture(nil) }
                     // A client that gave the host proxy its token as a WebSocket
                     // subprotocol expects the server to select that protocol.
                     var headers = HTTPHeaders()
-                    if let offered = request.headers[canonicalForm: "Sec-WebSocket-Protocol"]
-                        .first(where: { $0.hasPrefix("vphone-token.") })
-                    {
-                        headers.add(name: "Sec-WebSocket-Protocol", value: String(offered))
+                    if case .vsock = admission {
+                        if let offered = request.headers[canonicalForm: "Sec-WebSocket-Protocol"]
+                            .first(where: { $0.hasPrefix("vphone-token.") })
+                        {
+                            headers.add(name: "Sec-WebSocket-Protocol", value: String(offered))
+                        }
                     }
                     return channel.eventLoop.makeSucceededFuture(headers)
                 },
@@ -82,7 +86,8 @@ do {
                     // conformance is never required. The pipeline is unchanged.
                     channel.pipeline.removeHandler(http).flatMapThrowing {
                         let sync = channel.pipeline.syncOperations
-                        if let port = GuestPortForwardHandler.port(from: request.uri) {
+                        let path = request.uri.split(separator: "?", maxSplits: 1).first.map(String.init) ?? request.uri
+                        if let port = GuestPortForwardHandler.port(from: path) {
                             try sync.addHandlers([
                                 NIOWebSocketFrameAggregator(
                                     minNonFinalFragmentSize: 1,
@@ -117,10 +122,28 @@ do {
                 withServerUpgrade: (upgraders: [upgrader], completionHandler: { _ in }),
             ).flatMap { channel.pipeline.addHandler(http) }
         }
-        .bind(to: VsockAddress(cid: .any, port: 1339))
-        .wait()
+    }
+
+    let server: Channel
+    do {
+        server = try makeBootstrap(admission: .vsock)
+            .bind(to: VsockAddress(cid: .any, port: 1339)).wait()
+        NSLog("vphoned: HTTP/WebSocket API listening on vsock 1339")
+    } catch {
+        let tokenFile = URL(fileURLWithPath: "/usr/lib/vphone/research-api-token")
+        guard let data = try? Data(contentsOf: tokenFile),
+              data.count == 64,
+              data.allSatisfy({ (48 ... 57).contains($0) || (97 ... 102).contains($0) }),
+              let token = String(data: data, encoding: .ascii)
+        else { throw error }
+        if !vp_research_touch_start() {
+            NSLog("vphoned: Research touchscreen unavailable; input.touch will report an error")
+        }
+        server = try makeBootstrap(admission: .researchTCP(token: token))
+            .bind(host: "0.0.0.0", port: 1339).wait()
+        NSLog("vphoned: HTTP/WebSocket API listening on authenticated Research Guests TCP 1339")
+    }
     vp_native_confirm_cached_binary()
-    NSLog("vphoned: HTTP/WebSocket API listening on vsock 1339")
     server.closeFuture.whenComplete { _ in
         DispatchQueue.main.async {
             try? group.syncShutdownGracefully()

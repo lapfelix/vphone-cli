@@ -3,14 +3,19 @@
 import Foundation
 import Img4tool
 
+@_silgen_name("vphone_boot_lzfse_encode_buffer")
+private func vphoneBootLZFSEEncode(
+    _ destination: UnsafeMutablePointer<UInt8>,
+    _ destinationSize: Int,
+    _ source: UnsafePointer<UInt8>,
+    _ sourceSize: Int,
+) -> Int
+
 /// Handles loading, extracting, and re-packaging IM4P firmware containers.
 public enum IM4PHandler {
     /// Their `PAYP` properties (`arms`/`tz0s` for the SEP) describe how the
     /// image is loaded, so a rebuilt container keeps them.
     private static let paypPreservingFourCCs: Set<String> = ["trxm", "krnl", "sepi"]
-    /// Written back LZFSE-compressed: the image the boot ROM decodes itself.
-    static let lzfseFourCCs: Set<String> = ["ibss"]
-
     /// Load a firmware file as IM4P or raw data.
     ///
     /// - Parameter url: Path to the firmware file.
@@ -36,8 +41,8 @@ public enum IM4PHandler {
 
     /// Save patched data back to an IM4P container or as raw data.
     ///
-    /// If the original was IM4P, re-packages with the same fourcc and LZFSE compression.
-    /// Otherwise, writes raw bytes.
+    /// If the original was IM4P, re-packages with the same fourcc. iBSS is
+    /// LZFSE-compressed for the boot ROM. Otherwise, writes raw bytes.
     ///
     /// - Parameters:
     ///   - patchedData: The patched payload bytes.
@@ -49,29 +54,85 @@ public enum IM4PHandler {
         to url: URL,
     ) throws {
         if let original = originalIM4P {
-            // Rebuild the IM4P container with the patched payload. Do not force
-            // a new compression mode here; the Python pipeline currently writes
-            // these patched payloads back uncompressed and preserves any PAYP
-            // metadata tail from the original container.
-            //
-            // iBSS is the exception: the boot ROM unpacks it, and OpenAVB
-            // decodes only LZFSE (Apple's AVPBooter takes either), so it goes
-            // back compressed the way Apple ships it.
-            let newIM4P = try IM4P(
-                fourcc: original.fourcc,
-                description: original.description,
-                payload: patchedData,
-                compression: lzfseFourCCs.contains(original.fourcc) ? "lzfse" : nil,
-            )
-            let output: Data = if paypPreservingFourCCs.contains(original.fourcc) {
-                try appendPAYPIfPresent(from: original.data, to: newIM4P.data)
+            // iBSS is decoded by the boot ROM. Its LZFSE encoder uses a
+            // 3,750-match block limit; macOS Compression uses 10,000 and
+            // produces a valid stream that AVPBooter rejects.
+            let rebuilt: Data = if original.fourcc == "ibss" {
+                try makeBootIM4P(payload: patchedData, description: original.description)
             } else {
-                newIM4P.data
+                try IM4P(
+                    fourcc: original.fourcc,
+                    description: original.description,
+                    payload: patchedData,
+                ).data
+            }
+            let output: Data = if paypPreservingFourCCs.contains(original.fourcc) {
+                try appendPAYPIfPresent(from: original.data, to: rebuilt)
+            } else {
+                rebuilt
             }
             try output.write(to: url)
         } else {
             try patchedData.write(to: url)
         }
+    }
+
+    private static func makeBootIM4P(payload: Data, description: String) throws -> Data {
+        guard !payload.isEmpty, payload.count <= Int(UInt32.max), payload.count <= Int.max - 1024 else {
+            throw Img4Error.operationFailed("iBSS payload size cannot be LZFSE-encoded")
+        }
+
+        let capacity = payload.count + 1024
+        var compressed = Data(count: capacity)
+        let compressedCount = compressed.withUnsafeMutableBytes { output in
+            payload.withUnsafeBytes { input in
+                vphoneBootLZFSEEncode(
+                    output.baseAddress!.assumingMemoryBound(to: UInt8.self),
+                    capacity,
+                    input.baseAddress!.assumingMemoryBound(to: UInt8.self),
+                    payload.count,
+                )
+            }
+        }
+        guard compressedCount > 0, compressedCount <= capacity else {
+            throw Img4Error.operationFailed("iBSS LZFSE compression failed")
+        }
+        compressed.count = compressedCount
+
+        let compressionInfo = derElement(
+            0x30,
+            derUnsignedInteger(1) + derUnsignedInteger(payload.count),
+        )
+        return derElement(
+            0x30,
+            derIA5("IM4P")
+                + derIA5("ibss")
+                + derIA5(description)
+                + derElement(0x04, compressed)
+                + compressionInfo,
+        )
+    }
+
+    private static func derIA5(_ value: String) -> Data {
+        derElement(0x16, Data(value.utf8))
+    }
+
+    private static func derUnsignedInteger(_ value: Int) -> Data {
+        var remaining = value
+        var bytes: [UInt8] = []
+        repeat {
+            bytes.insert(UInt8(remaining & 0xFF), at: 0)
+            remaining >>= 8
+        } while remaining > 0
+        if bytes[0] & 0x80 != 0 { bytes.insert(0, at: 0) }
+        return derElement(0x02, Data(bytes))
+    }
+
+    private static func derElement(_ tag: UInt8, _ content: Data) -> Data {
+        var result = Data([tag])
+        result.append(derLengthBytes(content.count))
+        result.append(content)
+        return result
     }
 
     private static func appendPAYPIfPresent(from original: Data, to rebuilt: Data) throws -> Data {

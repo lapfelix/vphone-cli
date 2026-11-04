@@ -105,6 +105,20 @@ char * _Null_unspecified vp_homeview_distance_copy_json(const char * _Null_unspe
 /// safe to call more than once; returns false (injection then stays a no-op)
 /// on bases that do not expose the private symbols.
 bool vp_hid_load(void);
+/// Publish VZ's USB touchscreen report descriptor inside a Research Guest.
+/// Called only after the authenticated TCP fallback has been selected.
+bool vp_research_touch_start(void);
+/// True once the Research Guest transport has selected this touch path, even
+/// if device registration failed (so input requests report that failure).
+bool vp_research_touch_mode(void);
+/// Send one normalized single-finger report through the virtual touchscreen.
+/// Phase is 0 = down, 1 = move, 3 = up. Returns kIOReturnSuccess or an
+/// IOReturn failure; this path has no digitizer edge metadata.
+int vp_research_touch_report(int phase, double x, double y);
+/// Dispatch a digitizer event with edge flags from the registered Research
+/// touchscreen service's sender ID. Returns kIOReturnNotReady if that sender
+/// cannot be identified uniquely; phase and coordinates as above.
+int vp_research_touch_edge(int phase, double x, double y, int edge);
 /// A keyboard/consumer hold transition, including KeyboardLongPress on release.
 bool vp_hid_keyboard_hold(uint16_t page, uint16_t usage, bool down);
 
