@@ -8,8 +8,14 @@ final class GuestHyperTextHandler: ChannelInboundHandler, RemovableChannelHandle
     typealias InboundIn = HTTPServerRequestPart
     typealias OutboundOut = HTTPServerResponsePart
 
+    enum Admission: Sendable {
+        case vsock
+        case researchTCP(token: String)
+    }
+
     private let hub: APIEventHub
     private let fileIO: NonBlockingFileIO
+    private let admission: Admission
     private var head: HTTPRequestHead?
     private var body = Data()
     private var exceededLimit = false
@@ -17,9 +23,10 @@ final class GuestHyperTextHandler: ChannelInboundHandler, RemovableChannelHandle
     private var uploadError: (any Error)?
     private let maximumJSONBody = 1 << 20
 
-    init(hub: APIEventHub, fileIO: NonBlockingFileIO) {
+    init(hub: APIEventHub, fileIO: NonBlockingFileIO, admission: Admission = .vsock) {
         self.hub = hub
         self.fileIO = fileIO
+        self.admission = admission
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
@@ -31,7 +38,7 @@ final class GuestHyperTextHandler: ChannelInboundHandler, RemovableChannelHandle
             upload = nil
             uploadError = nil
             // Refuse before an upload stages any file in the guest.
-            if let refusal = Self.refusal(for: request) {
+            if let refusal = Self.refusal(for: request, admission: admission) {
                 head = nil
                 Self.send(refusal, on: context.channel)
                 return
@@ -167,6 +174,47 @@ final class GuestHyperTextHandler: ChannelInboundHandler, RemovableChannelHandle
         return hosts.count == 1 && localHostnames.contains(hostname(host).lowercased())
     }
 
+    /// The network path exists only when VSOCK is unavailable in Apple's VRE
+    /// host. The bearer is checked before the request can stage a file, queue
+    /// an RPC, or even read the health endpoint. A browser Origin is never a
+    /// first-party client, even when a token happens to be present.
+    private static func isResearchHTTPClient(_ headers: HTTPHeaders, token: String) -> Bool {
+        guard !headers.contains(name: "Origin") else { return false }
+        let hosts = headers["Host"]
+        guard hosts.count == 1 else { return false }
+        let authorization = headers["Authorization"]
+        guard authorization.count == 1, authorization[0].hasPrefix("Bearer ") else { return false }
+        return tokenMatches(String(authorization[0].dropFirst("Bearer ".count)), expected: token)
+    }
+
+    /// WebSocket clients cannot add an Authorization header, so the network
+    /// transport takes the same `?token=` query used by VPhoneAPIClient. The
+    /// VSOCK route retains its existing Host/Origin policy.
+    static func admitsWebSocket(_ request: HTTPRequestHead, admission: Admission) -> Bool {
+        switch admission {
+        case .vsock:
+            return isLocalClient(request.headers)
+        case let .researchTCP(token):
+            guard !request.headers.contains(name: "Origin"), request.headers["Host"].count == 1,
+                  let components = URLComponents(string: "http://vphoned\(request.uri)")
+            else { return false }
+            let supplied = components.queryItems?.filter { $0.name == "token" } ?? []
+            guard supplied.count == 1, let value = supplied[0].value else { return false }
+            return tokenMatches(value, expected: token)
+        }
+    }
+
+    /// Compare all bytes of a fixed-size random token. No token value is ever
+    /// echoed in an HTTP error or diagnostic log.
+    private static func tokenMatches(_ supplied: String, expected: String) -> Bool {
+        let lhs = Array(supplied.utf8)
+        let rhs = Array(expected.utf8)
+        guard lhs.count == 64, rhs.count == 64 else { return false }
+        var mismatch: UInt8 = 0
+        for index in lhs.indices { mismatch |= lhs[index] ^ rhs[index] }
+        return mismatch == 0
+    }
+
     private static func hostname(_ host: String) -> String {
         let value = host.trimmingCharacters(in: .whitespaces)
         if value.hasPrefix("[") {
@@ -183,9 +231,16 @@ final class GuestHyperTextHandler: ChannelInboundHandler, RemovableChannelHandle
     /// POST is the only method a web page can send cross-origin without a
     /// preflight, and only with a form or text content type, so JSON is
     /// required. Binary uploads use PUT.
-    private static func refusal(for request: HTTPRequestHead) -> APIReply? {
-        guard isLocalClient(request.headers) else {
-            return APIWire.error("Requests from web pages are not accepted", status: 403)
+    private static func refusal(for request: HTTPRequestHead, admission: Admission) -> APIReply? {
+        switch admission {
+        case .vsock:
+            guard isLocalClient(request.headers) else {
+                return APIWire.error("Requests from web pages are not accepted", status: 403)
+            }
+        case let .researchTCP(token):
+            guard isResearchHTTPClient(request.headers, token: token) else {
+                return APIWire.error("Research Guest API authorization required", status: 401)
+            }
         }
         if request.method == .POST {
             let type = request.headers.first(name: "Content-Type")?

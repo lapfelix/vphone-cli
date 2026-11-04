@@ -15,8 +15,11 @@
 
 #import "Include/VphonedNative.h"
 
+#import <IOKit/IOKitLib.h>
 #include <dlfcn.h>
 #include <mach/mach_time.h>
+#include <math.h>
+#include <stdatomic.h>
 
 typedef void *IOHIDEventSystemClientRef;
 typedef void *IOHIDEventRef;
@@ -40,6 +43,101 @@ static IOHIDEventRef (*pKeyboard)(CFAllocatorRef, uint64_t, uint32_t, uint32_t, 
 static IOHIDEventSystemClientRef gTouchClient;
 static dispatch_queue_t gTouchQueue;
 static bool gTouchUnavailableLogged;
+
+// Apple's Research Guests host has no USB touchscreen. Publish the same
+// four-finger HID descriptor as VZ's Virtual USB Touch Screen, captured in
+// Research/Guest/Evidence/iphone_duo_inner_hid_service_20261026.json, only
+// when the daemon uses the authenticated Research Guests TCP transport.
+typedef struct __IOHIDUserDevice *VPResearchHIDDeviceRef;
+static VPResearchHIDDeviceRef (*pResearchCreate)(CFAllocatorRef, CFDictionaryRef, IOOptionBits);
+static void (*pResearchSchedule)(VPResearchHIDDeviceRef, dispatch_queue_t);
+static IOReturn (*pResearchHandleReport)(VPResearchHIDDeviceRef, uint8_t *, CFIndex);
+static VPResearchHIDDeviceRef gResearchDevice;
+static dispatch_queue_t gResearchDeviceQueue;
+static dispatch_queue_t gResearchReportQueue;
+static bool gResearchTouchMode;
+static atomic_int gResearchLastStatus = ATOMIC_VAR_INIT(kIOReturnNotReady);
+static atomic_uint_fast64_t gResearchLastEdgeSender;
+static NSString *gResearchTouchError = @"not_started";
+// Accessed only from gResearchReportQueue while one edge gesture is active.
+static IOHIDEventSystemClientRef gResearchEdgeClient;
+static uint64_t gResearchEdgeSender;
+static uint32_t gResearchEdgeFlags;
+
+bool vp_research_touch_start(void) {
+    if (gResearchTouchMode) return gResearchDevice != NULL;
+    gResearchTouchMode = true;
+
+    void *ioKit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW);
+    pResearchCreate = ioKit ? dlsym(ioKit, "IOHIDUserDeviceCreateWithOptions") : NULL;
+    pResearchSchedule = ioKit ? dlsym(ioKit, "IOHIDUserDeviceScheduleWithDispatchQueue") : NULL;
+    pResearchHandleReport = ioKit ? dlsym(ioKit, "IOHIDUserDeviceHandleReport") : NULL;
+    if (!pResearchCreate || !pResearchSchedule || !pResearchHandleReport) {
+        gResearchTouchError = @"symbols_unavailable";
+        NSLog(@"vphoned: Research touchscreen: IOHIDUserDevice APIs unavailable");
+        return false;
+    }
+
+    // No report ID. Each of four fingers has a six-bit index, in-range and
+    // tip bits, then X and Y as 16-bit little-endian values: 20 bytes total.
+    NSString *encoded = @"BQ0JBKEBBQ0JIqECCTh1BpUBgQIJMgkzFQAlAXUBlQKBAgUBCTAJMRUAJv9/dRCVAoECwAUNCSKhAgk4dQaVAYECCTIJMxUAJQF1AZUCgQIFAQkwCTEVACb/f3UQlQKBAsAFDQkioQIJOHUGlQGBAgkyCTMVACUBdQGVAoECBQEJMAkxFQAm/391EJUCgQLABQ0JIqECCTh1BpUBgQIJMgkzFQAlAXUBlQKBAgUBCTAJMRUAJv9/dRCVAoECwMA=";
+    NSData *descriptor = [[NSData alloc] initWithBase64EncodedString:encoded options:0];
+    if (descriptor.length != 191) {
+        gResearchTouchError = @"invalid_descriptor";
+        NSLog(@"vphoned: Research touchscreen: captured HID descriptor is invalid");
+        return false;
+    }
+    NSDictionary *properties = @{
+        @"ReportDescriptor": descriptor,
+        @"Product": @"Virtual USB Touch Screen",
+        @"Manufacturer": @"VPhone",
+        @"Transport": @"USB",
+        @"VendorID": @0x05ac,
+        @"ProductID": @33032,
+        @"PhysicalDeviceUniqueID": @"vphone-research-touch",
+        @"DeviceUsagePage": @13,
+        @"DeviceUsage": @4,
+        @"DisplayIntegrated": @YES,
+        @"Built-In": @YES,
+        @"Authenticated": @YES,
+    };
+    gResearchDeviceQueue = dispatch_queue_create("com.vphone.vphoned.research-touch.device", DISPATCH_QUEUE_SERIAL);
+    gResearchReportQueue = dispatch_queue_create("com.vphone.vphoned.research-touch.report", DISPATCH_QUEUE_SERIAL);
+    gResearchDevice = pResearchCreate(kCFAllocatorDefault, (__bridge CFDictionaryRef)properties, 1 << 0);
+    if (!gResearchDevice) {
+        gResearchTouchError = @"device_creation_failed";
+        NSLog(@"vphoned: Research touchscreen: virtual HID device creation failed");
+        return false;
+    }
+    pResearchSchedule(gResearchDevice, gResearchDeviceQueue);
+    atomic_store(&gResearchLastStatus, kIOReturnSuccess);
+    gResearchTouchError = @"";
+    NSLog(@"vphoned: Research touchscreen: virtual HID device registered");
+    return true;
+}
+
+bool vp_research_touch_mode(void) { return gResearchTouchMode; }
+
+int vp_research_touch_report(int phase, double x, double y) {
+    if (!gResearchDevice || !pResearchHandleReport) return kIOReturnNotReady;
+    if (!isfinite(x) || !isfinite(y) ||
+        x < 0 || x > 1 || y < 0 || y > 1 || (phase != 0 && phase != 1 && phase != 3)) {
+        return kIOReturnBadArgument;
+    }
+    uint16_t px = (uint16_t)lround(x * 32767.0);
+    uint16_t py = (uint16_t)lround(y * 32767.0);
+    uint8_t report[20] = {
+        (uint8_t)(phase == 3 ? 1 : 0xC1),
+        (uint8_t)px, (uint8_t)(px >> 8), (uint8_t)py, (uint8_t)(py >> 8),
+    };
+    NSMutableData *reportData = [NSMutableData dataWithBytes:report length:sizeof(report)];
+    __block IOReturn status;
+    dispatch_sync(gResearchReportQueue, ^{
+        status = pResearchHandleReport(gResearchDevice, reportData.mutableBytes, reportData.length);
+        atomic_store(&gResearchLastStatus, status);
+    });
+    return status;
+}
 
 NSDictionary<NSString *, id> *vp_hid_input_devices(void) {
     void *ioKit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW);
@@ -76,7 +174,12 @@ NSDictionary<NSString *, id> *vp_hid_input_devices(void) {
     NSUInteger count = services ? (NSUInteger)CFArrayGetCount(services) : 0;
     if (services) CFRelease(services);
     CFRelease(client);
-    return @{@"available": @YES, @"serviceCount": @(count), @"services": rows};
+    return @{@"available": @YES, @"serviceCount": @(count), @"services": rows,
+             @"researchTouchMode": @(gResearchTouchMode),
+             @"researchTouchRegistered": @(gResearchDevice != NULL),
+             @"researchTouchError": gResearchTouchError,
+             @"researchTouchLastStatus": @(atomic_load(&gResearchLastStatus)),
+             @"researchEdgeSender": @(atomic_load(&gResearchLastEdgeSender))};
 }
 
 // Digitizer event-mask bits and transducer types (IOHIDEventTypes.h).
@@ -215,6 +318,102 @@ static uint32_t edge_flags(int edge) {
     if (edge & 4) aim |= 4; // right
     if (edge & 8) aim |= 8; // left
     return aim ? (VP_DIG_FROM_EDGE | (aim << VP_DIG_AIM_SHIFT)) : 0;
+}
+
+// The synthetic report device has its own HID service. A client-dispatched
+// edge event must use that service's sender ID; the old hard-coded sender is
+// not mapped to a display by backboardd on Apple's Research Guests host.
+static uint64_t research_digitizer_sender(IOHIDEventSystemClientRef client) {
+    void *ioKit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW);
+    CFArrayRef (*copyServices)(IOHIDEventSystemClientRef) = ioKit ? dlsym(ioKit, "IOHIDEventSystemClientCopyServices") : NULL;
+    CFTypeRef (*copyProperty)(const void *, CFStringRef) = ioKit ? dlsym(ioKit, "IOHIDServiceClientCopyProperty") : NULL;
+    CFTypeRef (*registryID)(const void *) = ioKit ? dlsym(ioKit, "IOHIDServiceClientGetRegistryID") : NULL;
+    if (!copyServices || !copyProperty || !registryID) return 0;
+
+    CFArrayRef services = copyServices(client);
+    uint64_t selected = 0;
+    int matches = 0;
+    for (CFIndex index = 0; services && index < CFArrayGetCount(services); index++) {
+        const void *service = CFArrayGetValueAtIndex(services, index);
+        CFTypeRef product = copyProperty(service, CFSTR("Product"));
+        CFTypeRef builtIn = copyProperty(service, CFSTR("Built-In"));
+        if (product && CFGetTypeID(product) == CFStringGetTypeID() &&
+            CFEqual(product, CFSTR("Virtual USB Touch Screen")) && builtIn == kCFBooleanTrue) {
+            CFTypeRef identifier = registryID(service); // borrowed CFNumber
+            int64_t value = 0;
+            if (identifier && CFGetTypeID(identifier) == CFNumberGetTypeID() &&
+                CFNumberGetValue((CFNumberRef)identifier, kCFNumberSInt64Type, &value) && value > 0) {
+                selected = (uint64_t)value;
+                matches++;
+            }
+        }
+        if (product) CFRelease(product);
+        if (builtIn) CFRelease(builtIn);
+    }
+    if (services) CFRelease(services);
+    return matches == 1 ? selected : 0;
+}
+
+static int research_edge_locked(int phase, double x, double y, int edge) {
+    if (phase == 0) {
+        if (gResearchEdgeClient) CFRelease(gResearchEdgeClient);
+        gResearchEdgeClient = pCreate(kCFAllocatorDefault);
+        gResearchEdgeSender = gResearchEdgeClient ? research_digitizer_sender(gResearchEdgeClient) : 0;
+        gResearchEdgeFlags = edge_flags(edge);
+        if (!gResearchEdgeSender) {
+            if (gResearchEdgeClient) CFRelease(gResearchEdgeClient);
+            gResearchEdgeClient = NULL;
+            NSLog(@"vphoned: Research touchscreen sender is missing or ambiguous");
+            return kIOReturnNotReady;
+        }
+        uint64_t previous = atomic_exchange(&gResearchLastEdgeSender, gResearchEdgeSender);
+        if (previous != gResearchEdgeSender) {
+            NSLog(@"vphoned: Research touchscreen sender 0x%llx", (unsigned long long)gResearchEdgeSender);
+        }
+    }
+    if (!gResearchEdgeClient || !gResearchEdgeSender) return kIOReturnNotReady;
+
+    uint32_t mask = (phase == 1 ? VP_DIG_POSITION : VP_DIG_TOUCH | VP_DIG_IDENTITY) | gResearchEdgeFlags;
+    boolean_t active = phase != 3;
+    uint64_t timestamp = mach_absolute_time();
+    IOHIDEventRef hand = pDigitizer(kCFAllocatorDefault, timestamp, VP_TRANSDUCER_HAND,
+                                   0, 0, mask, 0, x, y, 0, 0, 0, active, active, 0);
+    IOHIDEventRef finger = pFinger(kCFAllocatorDefault, timestamp, 1, 2, mask,
+                                   x, y, 0, 0, 0, active, active, 0);
+    if (!hand || !finger) {
+        if (hand) CFRelease(hand);
+        if (finger) CFRelease(finger);
+        return kIOReturnNoMemory;
+    }
+    pSetInt(hand, VP_FIELD_IS_DISPLAY_INTEGRATED, 1);
+    pSetInt(finger, VP_FIELD_IS_DISPLAY_INTEGRATED, 1);
+    pAppend(hand, finger, 0);
+    pSetSender(hand, gResearchEdgeSender);
+    pDispatch(gResearchEdgeClient, hand);
+    CFRelease(finger);
+    CFRelease(hand);
+
+    if (phase == 3) {
+        CFRelease(gResearchEdgeClient);
+        gResearchEdgeClient = NULL;
+        gResearchEdgeSender = 0;
+        gResearchEdgeFlags = 0;
+    }
+    return kIOReturnSuccess;
+}
+
+int vp_research_touch_edge(int phase, double x, double y, int edge) {
+    if (!gResearchDevice || !gResearchReportQueue || !vp_hid_load()) return kIOReturnNotReady;
+    if (!isfinite(x) || !isfinite(y) || x < 0 || x > 1 || y < 0 || y > 1 ||
+        (phase != 0 && phase != 1 && phase != 3) || edge_flags(edge) == 0) {
+        return kIOReturnBadArgument;
+    }
+    __block int status;
+    dispatch_sync(gResearchReportQueue, ^{
+        status = research_edge_locked(phase, x, y, edge);
+        atomic_store(&gResearchLastStatus, status);
+    });
+    return status;
 }
 
 void vp_hid_touch_edge(int phase, double x, double y, int edge) {
