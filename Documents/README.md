@@ -8,6 +8,7 @@ Start with the [Launchpad quick start](../README.md#get-started). For terminal u
 | --- | --- |
 | [Downloads](Downloads/README.md) | Notarized Launchpad versions and matching `VPhone.bundle` versions |
 | [Host Setup](Guides/host-setup.md) | Apple Silicon, SIP and AMFI settings, signing and preflight |
+| [Research Guests boot](Guides/research-guests-boot.md) | Developer USB boot and separate viewer for an already restored, CFW-installed VM with normal SIP |
 | [Create and Run](Guides/create-and-run.md) | The one-command flow, starting and stopping a VM, manual stages |
 | [Compatibility](Guides/compatibility.md) | Verified firmware pairs and what the checks prove |
 
